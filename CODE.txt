@@ -1,0 +1,206 @@
+S// ================== Required Libraries for the Smart Safety Pole Project ==================
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ================== WiFi & Firebase Configuration ==================
+#define WIFI_SSID      "Your SSID"
+#define WIFI_PASSWORD  "Your password"
+
+#define API_KEY        "AIzaSyBuFtg6XCCUoHvuLo8VH6M_wRnpJXp7vgo"
+#define DATABASE_URL   "https://protoz-9171b-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL     "admin@gmail.com"
+#define USER_PASSWORD  "123456"
+
+// Node name in Firebase
+#define NODE "/SafetyPole_001"
+
+// Firebase objects
+FirebaseData fb;
+FirebaseAuth auth;
+FirebaseConfig cfg;
+
+// ================== GPIO Pin Config ==================
+const int SP  = 34;   // Sound Sensor (Analog IN)
+const int PIR = 32;   // PIR Sensor (Digital OUT -> ESP32 input)
+const int BZ  = 15;   // Buzzer
+const int R   = 2;    // Red LED
+const int Y   = 16;   // Yellow LED
+const int G   = 17;   // Green LED
+
+#define DHTPIN 4
+DHT dht(DHTPIN, DHT11);
+
+// ================== Thresholds ==================
+const int S_EM = 400;  // Emergency sound threshold
+const int S_CA = 350;  // Caution sound threshold
+
+// ================== State variables ==================
+String st = "NORMAL";
+unsigned long lastT = 0;
+bool fbReady = false;
+
+// ================== TOKEN CALLBACK (RENAMED) ==================
+void myTokenStatusCallback(TokenInfo info) {
+    if (info.status == token_status_ready) {
+        fbReady = true;
+        Serial.println("Firebase Token Ready");
+    } else {
+        fbReady = false;
+        Serial.printf("Token Status: %s\n", info.error.message.c_str());
+    }
+}
+
+// ================== LED & BUZZER HANDLING ==================
+void leds(String s){
+    digitalWrite(R, LOW);
+    digitalWrite(Y, LOW);
+    digitalWrite(G, LOW);
+    digitalWrite(BZ, LOW);
+
+    if (s == "ALERT") {
+        digitalWrite(R, HIGH);
+        digitalWrite(BZ, HIGH);
+    }
+    else if (s == "CAUTION") {
+        digitalWrite(Y, HIGH);
+    }
+    else { // NORMAL
+        digitalWrite(G, HIGH);
+    }
+}
+
+void setState(String s){
+    if (s != st) {
+        Serial.printf("STATE CHANGE: %s -> %s\n", st.c_str(), s.c_str());
+        st = s;
+        leds(s);
+    }
+}
+
+// ================== WIFI ==================
+void wifi(){
+    Serial.print("Connecting WiFi");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    for (int i = 0; i < 30 && WiFi.status() != WL_CONNECTED; i++) {
+        delay(500);
+        Serial.print(".");
+    }
+
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.print("WiFi Connected. IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("WiFi Connection Failed!");
+    }
+}
+
+// ================== FIREBASE INIT ==================
+void fbInit(){
+    cfg.api_key = API_KEY;
+    cfg.database_url = DATABASE_URL;
+    auth.user.email = USER_EMAIL;
+    auth.user.password = USER_PASSWORD;
+
+    cfg.token_status_callback = myTokenStatusCallback;
+
+    Firebase.begin(&cfg, &auth);
+    Firebase.reconnectWiFi(true);
+
+    FirebaseJson j;
+    j.set("name", "Safety Pole 001");
+    j.set("status", "Online");
+
+    if (Firebase.RTDB.setJSON(&fb, NODE "/info", &j)) {
+        Serial.println("Firebase /info initialized.");
+    } else {
+        Serial.printf("Firebase init failed: %s\n", fb.errorReason().c_str());
+    }
+}
+
+// ================== SETUP ==================
+void setup(){
+    Serial.begin(115200);
+
+    pinMode(BZ, OUTPUT);
+    pinMode(R, OUTPUT);
+    pinMode(Y, OUTPUT);
+    pinMode(G, OUTPUT);
+
+    pinMode(PIR, INPUT);   // PIR digital input
+    // pinMode(SP, INPUT); // Not required for analogRead on ESP32, but OK if you want
+
+    dht.begin();
+    wifi();
+    fbInit();
+    setState("NORMAL");
+}
+
+// ================== LOOP ==================
+void loop(){
+    if (millis() - lastT >= 2000) {
+        lastT = millis();
+
+        int s   = analogRead(SP);      // Sound sensor
+        int pir = digitalRead(PIR);    // PIR: HIGH = motion, LOW = no motion
+        float h = dht.readHumidity();
+        float t = dht.readTemperature();
+
+        Serial.println("--- SENSOR DATA ---");
+        Serial.printf("Sound: %d\n", s);
+        Serial.printf("Motion: %d\n", pir);
+        Serial.printf("Temp/Hum: %.1fC / %.1f%%\n", t, h);
+
+        // ---------- DECISION LOGIC (Sound + PIR) ----------
+        String ns = "NORMAL";
+
+        if (s >= S_EM && pir == HIGH) {
+            ns = "ALERT";   // Very loud + motion = emergency
+        }
+        else if (s >= S_EM && pir == LOW) {
+            ns = "CAUTION"; // Very loud but no motion
+        }
+        else if (s >= S_CA && pir == HIGH) {
+            ns = "CAUTION"; // Moderate noise + motion
+        }
+        else if (pir == HIGH) {
+            ns = "CAUTION"; // Person near pole, sound normal
+        }
+        else {
+            ns = "NORMAL";
+        }
+
+        if (ns != st) setState(ns);
+
+        // -------------- FIREBASE UPDATE --------------
+        if (WiFi.status() == WL_CONNECTED && fbReady) {
+            FirebaseJson j;
+            j.set("ts", String(millis()));
+            j.set("st", st);
+            j.set("sound", s);
+            j.set("pir", pir);  // 1 or 0
+
+            if (!isnan(t) && !isnan(h)) {
+                j.set("temp", t);
+                j.set("hum", h);
+            }
+
+            String jsonStr;
+            j.toString(jsonStr, true);
+            Serial.printf("JSON: %s\n", jsonStr.c_str());
+
+            if (Firebase.RTDB.updateNode(&fb, NODE, &j)) {
+                Serial.println("Firebase Update OK");
+            } else {
+                Serial.printf("Firebase Update FAILED: %s\n", fb.errorReason().c_str());
+            }
+        }
+    }
+
+    delay(1); // yield
+}
